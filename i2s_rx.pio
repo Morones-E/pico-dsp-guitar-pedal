@@ -1,0 +1,52 @@
+; Receptor I2S.
+;
+; Este programa no genera ningún reloj. Corre en paralelo con i2s_tx, con el
+; mismo divisor y arrancando en el mismo ciclo (pio_enable_sm_mask_in_sync),
+; así que cada `in` cae donde debe sin mirar BCK ni LRCK.
+;
+; Por cada bit hace una pausa de 2 ciclos, lee el pin de datos y gasta otro
+; ciclo en el salto o en el `set`. En el instante de la lectura BCK acaba de
+; subir, que es cuando el ADC tiene el dato estable.
+;
+; Cada palabra son 32 bits (x = 30 en el bucle más el bit final), primero el
+; canal izquierdo y luego el derecho. El autopush empuja cada palabra a la
+; FIFO. Como el ADC entrega 24 bits, los 8 bits bajos llegan en cero.
+
+.program i2s_rx
+
+.wrap_target
+left_bits:
+    nop               [1]     ; espera, BCK en bajo
+    in pins, 1                ; lee un bit
+    jmp x-- left_bits         ; repite hasta contar 31 bits
+    nop               [1]
+    in pins, 1                ; bit 32 del canal izquierdo
+    set x, 30
+right_bits:
+    nop               [1]
+    in pins, 1
+    jmp x-- right_bits
+    nop               [1]
+    in pins, 1                ; bit 32 del canal derecho
+    set x, 30
+.wrap
+
+% c-sdk {
+// clk_div debe ser el mismo que usa i2s_tx.
+static inline void i2s_rx_program_init(PIO pio, uint sm, uint offset,
+                                       uint data_pin, float clk_div) {
+    pio_sm_config c = i2s_rx_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, data_pin);
+    pio_gpio_init(pio, data_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, false);
+
+    // 32 bits, MSB primero (desplazamiento a la izquierda), autopush
+    sm_config_set_in_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, clk_div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_exec(pio, sm, pio_encode_set(pio_x, 30));
+}
+%}

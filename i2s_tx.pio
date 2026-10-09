@@ -1,0 +1,62 @@
+; Transmisor I2S y generador de relojes.
+;
+; Saca 64 bits por trama (32 por canal, MSB primero) y maneja BCK y LRCK con
+; side-set. Cada bit dura 4 ciclos PIO, repartidos en dos instrucciones de
+; 2 ciclos. Ese margen es lo que le permite al programa i2s_rx leer el pin
+; de datos en el momento justo.
+;
+; Side-set (2 bits):
+;   bit 0 = BCK  (pin base)
+;   bit 1 = LRCK (pin base + 1)
+;
+; En I2S estándar LRCK cambia un BCK antes del MSB, por eso pasa a 1 (o a 0)
+; durante el último bit de cada palabra.
+;
+; x cuenta los bits del canal: arranca en 30, el salto `jmp x--` se toma
+; 30 veces y la instrucción final saca el bit 32. La función de init pone
+; x = 30 antes de arrancar.
+
+.program i2s_tx
+.side_set 2
+
+.wrap_target
+left_bits:
+    out pins, 1       side 0b00 [1]   ; dato, BCK=0, LRCK=0 (canal izquierdo)
+    jmp x-- left_bits side 0b01 [1]   ; BCK=1
+    out pins, 1       side 0b10 [1]   ; último bit izquierdo, LRCK pasa a 1
+    set x, 30         side 0b11 [1]   ; BCK=1, recarga el contador
+right_bits:
+    out pins, 1       side 0b10 [1]   ; dato, BCK=0, LRCK=1 (canal derecho)
+    jmp x-- right_bits side 0b11 [1]  ; BCK=1
+    out pins, 1       side 0b00 [1]   ; último bit derecho, LRCK pasa a 0
+    set x, 30         side 0b01 [1]   ; BCK=1, recarga el contador
+.wrap
+
+% c-sdk {
+// clock_pin_base es BCK; LRCK debe estar en clock_pin_base + 1.
+// clk_div es el divisor del reloj PIO: sys_clk / (fs * 64 bits * 4 ciclos).
+static inline void i2s_tx_program_init(PIO pio, uint sm, uint offset,
+                                       uint data_pin, uint clock_pin_base,
+                                       float clk_div) {
+    pio_sm_config c = i2s_tx_program_get_default_config(offset);
+
+    // Datos hacia el DAC
+    sm_config_set_out_pins(&c, data_pin, 1);
+    pio_gpio_init(pio, data_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+
+    // BCK y LRCK
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+    pio_sm_set_consecutive_pindirs(pio, sm, clock_pin_base, 2, true);
+
+    // 32 bits, MSB primero (desplazamiento a la izquierda), autopull
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, clk_div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_exec(pio, sm, pio_encode_set(pio_x, 30));
+}
+%}
